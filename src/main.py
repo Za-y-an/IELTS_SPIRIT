@@ -28,7 +28,9 @@ from rich.table import Table
 from config import get_settings
 from db.postgres import get_async_engine, log_rag_interaction, verify_postgres_read_write
 from db.vector_store import ensure_collection, get_qdrant_client
-from ingestion.chunker import RecursiveTextSplitter, TextChunk
+from ingestion.bengali_normalizer import normalize_extracted_pages
+
+from ingestion.chunker import QAStructureSplitter, RecursiveTextSplitter, TextChunk
 from ingestion.embedder import (
     GeminiEmbedder,
     generate_deterministic_mock_vector,
@@ -38,10 +40,9 @@ from ingestion.embedder import (
 from ingestion.pdf_loader import download_pdf, extract_text_from_pdf
 from rag.engine import answer_question
 
+
 console = Console(legacy_windows=False)
 
-# Reliable, small public PDF for testing document ingestion
-DEFAULT_SAMPLE_PDF_URL = "https://raw.githubusercontent.com/py-pdf/pypdf/main/resources/crazyones.pdf"
 
 
 def render_config_table(settings_summary: Dict[str, str]) -> None:
@@ -82,7 +83,11 @@ def render_subsystems_table(statuses: Dict[str, Dict[str, Any]]) -> None:
     console.print()
 
 
-async def run_pipeline(pdf_url: str, allow_fake_embeddings: bool = False) -> None:
+async def run_pipeline(
+    pdf_path: Optional[str] = None,
+    pdf_url: Optional[str] = None,
+    allow_fake_embeddings: bool = False,
+) -> None:
     """Run full ingestion, chunking, embedding, upsert, retrieval test, and Postgres check."""
     settings = get_settings()
 
@@ -115,34 +120,80 @@ async def run_pipeline(pdf_url: str, allow_fake_embeddings: bool = False) -> Non
         "PostgreSQL (Supabase Async)": {"ok": False, "detail": "Pending verification"},
     }
 
-    # Step 2: Download & Parse PDF
-    docs_dir = PROJECT_ROOT / "data" / "raw_docs"
-    console.print(f"[bold blue]Step 1/4:[/bold blue] Fetching PDF from [underline]{pdf_url}[/underline]...")
-    try:
-        pdf_path = await download_pdf(pdf_url, docs_dir)
-        console.print(f"  [green]✔[/green] Downloaded to: [bold]{pdf_path.relative_to(PROJECT_ROOT)}[/bold]")
+    # Step 2: Resolve & Parse PDF
+    resolved_path: Path
+    if pdf_path:
+        local_p = Path(pdf_path)
+        if not local_p.is_absolute():
+            local_p = PROJECT_ROOT / local_p
+        if not local_p.exists():
+            console.print(f"  [bold red]✖ Local PDF file not found at:[/bold red] {local_p}")
+            console.print("[bold red]Pipeline halted due to document load failure.[/bold red]")
+            sys.exit(1)
+        resolved_path = local_p
+        console.print(f"[bold blue]Step 1/4:[/bold blue] Ingesting local PDF: [bold]{resolved_path.relative_to(PROJECT_ROOT)}[/bold]...")
+    elif pdf_url:
+        docs_dir = PROJECT_ROOT / "data" / "raw_docs"
+        console.print(f"[bold blue]Step 1/4:[/bold blue] Fetching PDF from [underline]{pdf_url}[/underline]...")
+        try:
+            resolved_path = await download_pdf(pdf_url, docs_dir)
+            console.print(f"  [green]✔[/green] Downloaded to: [bold]{resolved_path.relative_to(PROJECT_ROOT)}[/bold]")
+        except Exception as exc:
+            console.print(f"  [bold red]✖ Failed to load PDF:[/bold red] {exc}")
+            console.print("[bold red]Pipeline halted due to document load failure.[/bold red]")
+            sys.exit(1)
+    else:
+        console.print("[bold red]✖ Error: Must provide either --pdf-path or --pdf-url[/bold red]")
+        sys.exit(1)
 
-        pages = extract_text_from_pdf(pdf_path)
+    try:
+        pages = extract_text_from_pdf(resolved_path)
         total_chars = sum(len(p["text"]) for p in pages)
         console.print(f"  [green]✔[/green] Extracted {len(pages)} page(s) ({total_chars} total characters).")
     except Exception as exc:
-        console.print(f"  [bold red]✖ Failed to load PDF:[/bold red] {exc}")
-        console.print("[bold red]Pipeline halted due to document load failure.[/bold red]")
+        console.print(f"  [bold red]✖ Failed to extract text from PDF:[/bold red] {exc}")
+        console.print("[bold red]Pipeline halted due to document extraction failure.[/bold red]")
         sys.exit(1)
 
-    # Step 3: Chunking
-    console.print("\n[bold blue]Step 2/4:[/bold blue] Chunking text with recursive character splitter...")
-    splitter = RecursiveTextSplitter(
-        chunk_size=settings.chunk_size,
-        chunk_overlap=settings.chunk_overlap,
-    )
-    chunks: List[TextChunk] = splitter.split_pages(pages)
+    # Step 3: Normalization & Chunking
+    is_qa_doc = "ielts" in resolved_path.name.lower() or any("Package" in p.get("text", "") for p in pages)
+    
+    pages_to_chunk = pages
+    if is_qa_doc:
+        console.print("\n[bold blue]Applying Controlled Bengali Normalization...[/bold blue]")
+        norm_pages, norm_report = normalize_extracted_pages(pages)
+        console.print(
+            f"  [green]✔[/green] Normalized [bold]{len(norm_pages)}[/bold] page(s) "
+            f"({norm_report.total_replacements} replacements across {len(norm_report.rules_applied)} distinct grounded rules)."
+        )
+        console.print(
+            f"  [dim]Characters: {norm_report.original_char_count} -> {norm_report.normalized_char_count} "
+            f"| Preserved all pricing, numbers, and English terms.[/dim]"
+        )
+        pages_to_chunk = norm_pages
+
+        console.print("\n[bold blue]Step 2/4:[/bold blue] Chunking text with [bold]QAStructureSplitter[/bold] (preserving Q&A pairs & package headers)...")
+        splitter = QAStructureSplitter(
+            max_chunk_size=settings.chunk_size,
+            fallback_splitter=RecursiveTextSplitter(
+                chunk_size=settings.chunk_size,
+                chunk_overlap=settings.chunk_overlap,
+            ),
+        )
+    else:
+        console.print("\n[bold blue]Step 2/4:[/bold blue] Chunking text with [bold]RecursiveTextSplitter[/bold]...")
+        splitter = RecursiveTextSplitter(
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+        )
+
+    chunks: List[TextChunk] = splitter.split_pages(pages_to_chunk)
     console.print(
         f"  [green]✔[/green] Generated [bold]{len(chunks)}[/bold] chunk(s) "
-        f"(chunk_size={settings.chunk_size} chars, overlap={settings.chunk_overlap} chars)."
+        f"(mode={'QAStructureSplitter' if is_qa_doc else 'RecursiveTextSplitter'})."
     )
     if chunks:
-        sample_preview = chunks[0].text[:80].replace("\n", " ")
+        sample_preview = chunks[0].text[:120].replace("\n", " ")
         console.print(f"  [dim]Sample chunk (chars={chunks[0].char_count}): \"{sample_preview}...\"[/dim]")
 
     # Step 4: Embedding generation
@@ -214,8 +265,9 @@ async def run_pipeline(pdf_url: str, allow_fake_embeddings: bool = False) -> Non
 
     # Run test similarity query
     console.print("\n[bold blue]Step 4/4:[/bold blue] Executing test similarity retrieval...")
-    test_query = "Who are the rebels, troublemakers, and crazy ones that change things?"
+    test_query = "Platinum প্যাকেজের কোর্স ফি কত?" if is_qa_doc else "What are the main key points of this document?"
     console.print(f"  [italic]Query:[/italic] [bold cyan]\"{test_query}\"[/bold cyan]")
+
 
     if qdrant_client:
         try:
@@ -421,6 +473,12 @@ async def run_ask_pipeline(question: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="IELTS Spirit - Ingestion & Persistence CLI")
     parser.add_argument(
+        "--pdf-path",
+        type=str,
+        default=None,
+        help="Local file path of the PDF document to ingest (e.g. data/raw_docs/ielts.pdf)",
+    )
+    parser.add_argument(
         "--pdf-url",
         type=str,
         default=None,
@@ -443,10 +501,20 @@ def main() -> None:
 
     if args.ask:
         asyncio.run(run_ask_pipeline(args.ask))
+    elif args.pdf_path or args.pdf_url:
+        asyncio.run(
+            run_pipeline(
+                pdf_path=args.pdf_path,
+                pdf_url=args.pdf_url,
+                allow_fake_embeddings=args.offline,
+            )
+        )
     else:
-        pdf_target = args.pdf_url or DEFAULT_SAMPLE_PDF_URL
-        asyncio.run(run_pipeline(pdf_target, allow_fake_embeddings=args.offline))
+        parser.print_help()
+        console.print("\n[yellow]Please specify --pdf-path, --pdf-url, or --ask.[/yellow]")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+

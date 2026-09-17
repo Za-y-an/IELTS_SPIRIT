@@ -19,20 +19,44 @@ class GeminiEmbedder:
             raise ValueError("GEMINI_API_KEY is not configured.")
         self.client = genai.Client(api_key=api_key)
 
-    async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+    async def get_embeddings(self, texts: List[str], batch_size: int = 50) -> List[List[float]]:
         """
         Fetch vector embeddings asynchronously for a list of texts using Gemini.
+        Batches requests into chunks of <= 100 (default 50) and includes automatic
+        exponential backoff on rate limits (HTTP 429 / RESOURCE_EXHAUSTED).
         Returns a list of float vectors (default length 3072).
         """
         if not texts:
             return []
 
-        # Gemini supports list of contents in embed_content
-        response = await self.client.aio.models.embed_content(
-            model=self.model,
-            contents=texts,
-        )
-        return [list(item.values) for item in response.embeddings]
+        import asyncio
+        all_embeddings: List[List[float]] = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    response = await self.client.aio.models.embed_content(
+                        model=self.model,
+                        contents=batch,
+                    )
+                    all_embeddings.extend([list(item.values) for item in response.embeddings])
+                    break
+                except Exception as exc:
+                    err_str = str(exc)
+                    if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and attempt < max_retries - 1:
+                        wait_time = 12 * (attempt + 1)
+                        await asyncio.sleep(wait_time)
+                    else:
+                        raise
+
+            # Brief courtesy delay between batches to respect rate quotas
+            if i + batch_size < len(texts):
+                await asyncio.sleep(1.0)
+
+        return all_embeddings
+
+
 
     async def get_query_embedding(self, query: str) -> List[float]:
         """Fetch vector embedding for a search query string."""
@@ -78,11 +102,16 @@ def upsert_chunks_to_qdrant(
             )
         )
 
-    client.upsert(
-        collection_name=collection_name,
-        points=points,
-    )
+    batch_size = 40
+    for i in range(0, len(points), batch_size):
+        batch = points[i : i + batch_size]
+        client.upsert(
+            collection_name=collection_name,
+            points=batch,
+            wait=True,
+        )
     return len(points)
+
 
 
 def query_qdrant_similar(

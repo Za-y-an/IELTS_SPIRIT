@@ -10,6 +10,7 @@ class TextChunk:
     source: str
     char_count: int
     estimated_tokens: int
+    section: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -19,7 +20,9 @@ class TextChunk:
             "source": self.source,
             "char_count": self.char_count,
             "estimated_tokens": self.estimated_tokens,
+            "section": self.section,
         }
+
 
 
 class RecursiveTextSplitter:
@@ -176,3 +179,135 @@ class RecursiveTextSplitter:
                 global_idx += 1
 
         return all_chunks
+
+
+class QAStructureSplitter:
+    """
+    Structure-aware chunker designed for Q&A documents (e.g. IELTS Spirit package FAQs).
+    Groups content by course package sections and pairs questions with their answers,
+    attaching the package header as context metadata to ensure clean semantic retrieval.
+    """
+
+    def __init__(self, max_chunk_size: int = 800, fallback_splitter: Optional[RecursiveTextSplitter] = None):
+        self.max_chunk_size = max_chunk_size
+        self.fallback_splitter = fallback_splitter or RecursiveTextSplitter(chunk_size=max_chunk_size)
+
+    def _is_section_header(self, line: str) -> bool:
+        clean = line.strip()
+        import re
+        if re.match(r'^[১-৯\d]+\.\s*(Platinum|Premium|Regular)', clean, re.IGNORECASE):
+            return True
+        named_sections = [
+            "চলুন জেনন জনই", "চলুন জেনে নেই",
+            "প্ররতষ্ঠাতা ও রসইও", "প্রতিষ্ঠাতা ও সিইও",
+            "কযাোশযাশেি টিকানা", "যোগাযোগের ঠিকানা",
+            "আমাশদি অফিনের জলানেশন", "আমাদের অফিসের লোকেশন",
+        ]
+        return any(ns in clean for ns in named_sections)
+
+    def _is_question(self, line: str) -> bool:
+        clean = line.strip()
+        if clean.endswith("?") or clean.endswith("? "):
+            return True
+        q_markers = ["েত?", "কত?", "জেমন?", "কেমন?", "কাদের জন্য?", "োনের েনয?", "আনে ফে?", "আছে কি?"]
+        return any(m in clean for m in q_markers)
+
+    def split_pages(self, pages: List[dict[str, Any]]) -> List[TextChunk]:
+        flat_lines = []
+        for p in pages:
+            page_num = p["page"]
+            source = p.get("source", "unknown.pdf")
+            lines = p["text"].split("\n")
+            for line in lines:
+                l_s = line.strip()
+                if l_s:
+                    flat_lines.append({"text": l_s, "page": page_num, "source": source})
+
+        chunks: List[TextChunk] = []
+        current_section = "General Information / সাধারণ পরিচিতি"
+        current_q: Optional[str] = None
+        current_a_lines: List[str] = []
+        q_start_page = 1
+        source = pages[0].get("source", "unknown.pdf") if pages else "unknown.pdf"
+        global_idx = 0
+
+        def emit_chunk(q: Optional[str], ans_lines: List[str], page: int, section: str):
+            nonlocal global_idx
+            ans_text = " ".join(ans_lines).strip()
+            if not q and not ans_text:
+                return
+
+            if q:
+                header = f"[প্যাকেজ/সেকশন: {section}]\nপ্রশ্ন: {q}\nউত্তর: {ans_text}"
+            else:
+                header = f"[প্যাকেজ/সেকশন: {section}]\n{ans_text}"
+
+            if len(header) > self.max_chunk_size and self.fallback_splitter:
+                sub_chunks = self.fallback_splitter._split_text_recursively(header, self.fallback_splitter.separators)
+                for sc in sub_chunks:
+                    c = TextChunk(
+                        text=sc,
+                        chunk_index=global_idx,
+                        page=page,
+                        source=source,
+                        char_count=len(sc),
+                        estimated_tokens=max(1, len(sc) // 4),
+                        section=section,
+                    )
+                    chunks.append(c)
+                    global_idx += 1
+            else:
+                c = TextChunk(
+                    text=header,
+                    chunk_index=global_idx,
+                    page=page,
+                    source=source,
+                    char_count=len(header),
+                    estimated_tokens=max(1, len(header) // 4),
+                    section=section,
+                )
+                chunks.append(c)
+                global_idx += 1
+
+        i = 0
+        while i < len(flat_lines):
+            item = flat_lines[i]
+            line = item["text"]
+            page = item["page"]
+
+            if self._is_section_header(line):
+                emit_chunk(current_q, current_a_lines, q_start_page, current_section)
+                current_q = None
+                current_a_lines = []
+                current_section = line
+                q_start_page = page
+                i += 1
+                continue
+
+            if (line in ["হনব্?", "হবে?"] or line.endswith("?")) and current_q and not self._is_question(current_q):
+                current_q = f"{current_q} {line}"
+                i += 1
+                continue
+
+            if i + 1 < len(flat_lines) and (flat_lines[i + 1]["text"] in ["হনব্?", "হবে?"] or (flat_lines[i + 1]["text"].endswith("?") and len(line) < 90 and not line.endswith("।"))):
+                emit_chunk(current_q, current_a_lines, q_start_page, current_section)
+                current_q = f"{line} {flat_lines[i + 1]['text']}"
+                current_a_lines = []
+                q_start_page = page
+                i += 2
+                continue
+
+            if self._is_question(line):
+                emit_chunk(current_q, current_a_lines, q_start_page, current_section)
+                current_q = line
+                current_a_lines = []
+                q_start_page = page
+                i += 1
+                continue
+
+            current_a_lines.append(line)
+            i += 1
+
+        emit_chunk(current_q, current_a_lines, q_start_page, current_section)
+        return chunks
+

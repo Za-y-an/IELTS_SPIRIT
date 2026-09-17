@@ -26,7 +26,9 @@ def get_qdrant_client(settings: Settings, force_memory: bool = False) -> QdrantC
     return QdrantClient(
         url=settings.qdrant_url.strip(),
         api_key=settings.qdrant_api_key.strip() if settings.qdrant_api_key else None,
+        timeout=60.0,
     )
+
 
 
 def ensure_collection(
