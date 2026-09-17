@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[oc]
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Environment variables & secrets
+.env
+*.env.local
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project data / downloaded files
+data/raw_docs/*
+!data/raw_docs/.gitkeep
+
+# Database & local storage
+*.sqlite
+*.sqlite3
+*.db
+data/qdrant_storage/
+
+# Logs & temp
+*.log
+.pytest_cache/
+.coverage
+htmlcov/

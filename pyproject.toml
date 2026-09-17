@@ -1,0 +1,27 @@
+[project]
+name = "ielts-spirit"
+version = "0.1.0"
+description = "RAG-powered WhatsApp support agent for IELTS coaching client"
+readme = "README.md"
+authors = [
+    { name = "IELTS Spirit Team" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "asyncpg>=0.31.0",
+    "google-genai>=2.24.0",
+    "httpx>=0.28.1",
+    "pydantic-settings>=2.15.0",
+    "pypdf>=6.19.0",
+    "qdrant-client>=1.19.1",
+    "rich>=15.0.0",
+    "sqlalchemy[asyncio]>=2.0",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
